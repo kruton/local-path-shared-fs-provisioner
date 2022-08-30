@@ -171,13 +171,9 @@ func (p *LocalPathProvisioner) getRandomPathOnNode(node string) (string, error) 
 	}
 
 	c := p.config
-	npMap := c.NodePathMap[node]
+	npMap := c.NodePathMap[NodeDefaultNonListedNodes]
 	if npMap == nil {
-		npMap = c.NodePathMap[NodeDefaultNonListedNodes]
-		if npMap == nil {
-			return "", fmt.Errorf("config doesn't contain node %v, and no %v available", node, NodeDefaultNonListedNodes)
-		}
-		logrus.Debugf("config doesn't contain node %v, use %v instead", node, NodeDefaultNonListedNodes)
+		return "", fmt.Errorf("no %v available", NodeDefaultNonListedNodes)
 	}
 	paths := npMap.Paths
 	if len(paths) == 0 {
@@ -223,7 +219,6 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 		Path:        path,
 		Mode:        *pvc.Spec.VolumeMode,
 		SizeInBytes: storage.Value(),
-		Node:        node.Name,
 	}); err != nil {
 		return nil, err
 	}
@@ -278,12 +273,12 @@ func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to delete volume %v", pv.Name)
 	}()
-	path, node, err := p.getPathAndNodeForPV(pv)
+	path, err := p.getPathForPV(pv)
 	if err != nil {
 		return err
 	}
 	if pv.Spec.PersistentVolumeReclaimPolicy != v1.PersistentVolumeReclaimRetain {
-		logrus.Infof("Deleting volume %v at %v:%v", pv.Name, node, path)
+		logrus.Infof("Deleting volume %v at %v", pv.Name, path)
 		storage := pv.Spec.Capacity[v1.ResourceName(v1.ResourceStorage)]
 		cleanupCmd := []string{"/bin/sh", "/script/teardown"}
 		if err := p.createHelperPod(ActionTypeDelete, cleanupCmd, volumeOptions{
@@ -291,7 +286,6 @@ func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
 			Path:        path,
 			Mode:        *pv.Spec.VolumeMode,
 			SizeInBytes: storage.Value(),
-			Node:        node,
 		}); err != nil {
 			logrus.Infof("clean up volume %v failed: %v", pv.Name, err)
 			return err
@@ -302,45 +296,18 @@ func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
 	return nil
 }
 
-func (p *LocalPathProvisioner) getPathAndNodeForPV(pv *v1.PersistentVolume) (path, node string, err error) {
+func (p *LocalPathProvisioner) getPathForPV(pv *v1.PersistentVolume) (path string, err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to delete volume %v", pv.Name)
 	}()
 
 	hostPath := pv.Spec.PersistentVolumeSource.HostPath
 	if hostPath == nil {
-		return "", "", fmt.Errorf("no HostPath set")
+		return "", fmt.Errorf("no HostPath set")
 	}
 	path = hostPath.Path
 
-	nodeAffinity := pv.Spec.NodeAffinity
-	if nodeAffinity == nil {
-		return "", "", fmt.Errorf("no NodeAffinity set")
-	}
-	required := nodeAffinity.Required
-	if required == nil {
-		return "", "", fmt.Errorf("no NodeAffinity.Required set")
-	}
-
-	node = ""
-	for _, selectorTerm := range required.NodeSelectorTerms {
-		for _, expression := range selectorTerm.MatchExpressions {
-			if expression.Key == KeyNode && expression.Operator == v1.NodeSelectorOpIn {
-				if len(expression.Values) != 1 {
-					return "", "", fmt.Errorf("multiple values for the node affinity")
-				}
-				node = expression.Values[0]
-				break
-			}
-		}
-		if node != "" {
-			break
-		}
-	}
-	if node == "" {
-		return "", "", fmt.Errorf("cannot find affinited node")
-	}
-	return path, node, nil
+	return path, nil
 }
 
 type volumeOptions struct {
@@ -348,15 +315,14 @@ type volumeOptions struct {
 	Path        string
 	Mode        v1.PersistentVolumeMode
 	SizeInBytes int64
-	Node        string
 }
 
 func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, o volumeOptions) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to %v volume %v", action, o.Name)
 	}()
-	if o.Name == "" || o.Path == "" || o.Node == "" {
-		return fmt.Errorf("invalid empty name or path or node")
+	if o.Name == "" || o.Path == "" {
+		return fmt.Errorf("invalid empty name or path")
 	}
 	if !filepath.IsAbs(o.Path) {
 		return fmt.Errorf("volume path %s is not absolute", o.Path)
@@ -425,7 +391,6 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 		helperPod.Name = helperPod.Name[:HelperPodNameMaxLength]
 	}
 	helperPod.Namespace = p.namespace
-	helperPod.Spec.NodeName = o.Node
 	helperPod.Spec.ServiceAccountName = p.serviceAccountName
 	helperPod.Spec.RestartPolicy = v1.RestartPolicyNever
 	helperPod.Spec.Tolerations = append(helperPod.Spec.Tolerations, lpvTolerations...)
@@ -465,7 +430,7 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 		return fmt.Errorf("create process timeout after %v seconds", p.config.CmdTimeoutSeconds)
 	}
 
-	logrus.Infof("Volume %v has been %vd on %v:%v", o.Name, action, o.Node, o.Path)
+	logrus.Infof("Volume %v has been %vd on %v", o.Name, action, o.Path)
 	return nil
 }
 
@@ -523,6 +488,9 @@ func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
 	cfg = &Config{}
 	cfg.NodePathMap = map[string]*NodePathMap{}
 	for _, n := range data.NodePathMap {
+		if n.Node != NodeDefaultNonListedNodes {
+			return nil, fmt.Errorf("only %v supported; got %v", NodeDefaultNonListedNodes, n.Node)
+		}
 		if cfg.NodePathMap[n.Node] != nil {
 			return nil, fmt.Errorf("duplicate node %v", n.Node)
 		}
